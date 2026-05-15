@@ -2,13 +2,19 @@ import os
 import sys
 import threading
 import subprocess
+import concurrent.futures
 from pathlib import Path
 from tkinter import filedialog, colorchooser
 from PIL import Image, ImageOps
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 import customtkinter as ctk
 
 # --- НАСТРОЙКИ ---
-SUPPORTED_FORMATS = ('.jpg', '.jpeg', '.png', '.webp')
+SUPPORTED_FORMATS = ('.jpg', '.jpeg', '.png', '.webp', '.heic', '.bmp', '.tiff', '.tif', '.gif')
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -458,7 +464,7 @@ class PhotoConverterApp(ctk.CTk):
             self.file_list_box.pack_forget()
             
     def select_files(self):
-        filetypes = [("Изображения", "*.jpg *.jpeg *.png *.webp"), ("Все файлы", "*.*")]
+        filetypes = [("Изображения", "*.jpg *.jpeg *.png *.webp *.heic *.bmp *.tiff *.tif *.gif"), ("Все файлы", "*.*")]
         files = filedialog.askopenfilenames(initialdir=self.source_dir, filetypes=filetypes)
         if files:
             self.selected_files = list(files)
@@ -580,6 +586,62 @@ class PhotoConverterApp(ctk.CTk):
         thread = threading.Thread(target=self.process_images, args=(q, mode, size, lossless, pad_color, only_shrink, open_folder), daemon=True)
         thread.start()
 
+    def process_single_image(self, file, output_path, quality, resize_mode, size, lossless, pad_color, only_shrink):
+        if self.stop_event.is_set():
+            return False, ""
+            
+        try:
+            with Image.open(file) as img:
+                # Сохраняем прозрачность
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                
+                if resize_mode and size:
+                    img_w, img_h = img.size
+                    target_w, target_h = size
+                    
+                    is_smaller = (img_w <= target_w and img_h <= target_h)
+                    
+                    if is_smaller and only_shrink:
+                        # Если фото маленькое и мы НЕ хотим его растягивать
+                        if resize_mode == 'pad':
+                            # Создаем большой холст и кладем фото по центру
+                            if pad_color and len(pad_color) == 4 and pad_color[3] == 0:
+                                img = img.convert("RGBA")
+                                current_pad_color = pad_color
+                            else:
+                                current_pad_color = pad_color if img.mode == "RGBA" else pad_color[:3]
+                            
+                            new_img = Image.new(img.mode, size, current_pad_color)
+                            offset_x = (target_w - img_w) // 2
+                            offset_y = (target_h - img_h) // 2
+                            new_img.paste(img, (offset_x, offset_y))
+                            img = new_img
+                    else:
+                        # Обычная обработка (для больших фото или если разрешено растягивание)
+                        if resize_mode == 'outside':
+                            img = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+                        elif resize_mode == 'inside':
+                            img = ImageOps.contain(img, size, method=Image.Resampling.LANCZOS)
+                        elif resize_mode == 'exact':
+                            img = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS)
+                        elif resize_mode == 'pad':
+                            # Если требуется прозрачность, переводим изображение в RGBA перед заливкой
+                            if pad_color and len(pad_color) == 4 and pad_color[3] == 0:
+                                img = img.convert("RGBA")
+                                current_pad_color = pad_color
+                            else:
+                                current_pad_color = pad_color if img.mode == "RGBA" else pad_color[:3]
+                            img = ImageOps.pad(img, size, method=Image.Resampling.LANCZOS, color=current_pad_color)
+
+                out_name = file.stem + ".webp"
+                final_dest = output_path / out_name
+                img.save(final_dest, "webp", quality=quality, lossless=lossless)
+                return True, f"OK: {file.name} -> {out_name}"
+                
+        except Exception as e:
+            return False, f"Ошибка в файле {file.name}: {e}"
+
     def process_images(self, quality, resize_mode, size, lossless=False, pad_color=None, only_shrink=True, open_folder=True):
         try:
             if self.selected_files:
@@ -607,69 +669,35 @@ class PhotoConverterApp(ctk.CTk):
             self.log(f"Папка экспорта: {output_path.name}")
             self.log(f"Найдено файлов: {total_files}. Обработка...")
 
-            for i, file in enumerate(files, 1):
-                if self.stop_event.is_set():
-                    break
-                
-                try:
-                    with Image.open(file) as img:
-                        # Сохраняем прозрачность
-                        if img.mode == "P":
-                            img = img.convert("RGBA")
-                        
-                        if resize_mode and size:
-                            img_w, img_h = img.size
-                            target_w, target_h = size
-                            
-                            is_smaller = (img_w <= target_w and img_h <= target_h)
-                            
-                            if is_smaller and only_shrink:
-                                # Если фото маленькое и мы НЕ хотим его растягивать
-                                if resize_mode == 'pad':
-                                    # Создаем большой холст и кладем фото по центру
-                                    if pad_color and len(pad_color) == 4 and pad_color[3] == 0:
-                                        img = img.convert("RGBA")
-                                        current_pad_color = pad_color
-                                    else:
-                                        current_pad_color = pad_color if img.mode == "RGBA" else pad_color[:3]
-                                    
-                                    new_img = Image.new(img.mode, size, current_pad_color)
-                                    offset_x = (target_w - img_w) // 2
-                                    offset_y = (target_h - img_h) // 2
-                                    new_img.paste(img, (offset_x, offset_y))
-                                    img = new_img
-                            else:
-                                # Обычная обработка (для больших фото или если разрешено растягивание)
-                                if resize_mode == 'outside':
-                                    img = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-                                elif resize_mode == 'inside':
-                                    img = ImageOps.contain(img, size, method=Image.Resampling.LANCZOS)
-                                elif resize_mode == 'exact':
-                                    img = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS)
-                                elif resize_mode == 'pad':
-                                    # Если требуется прозрачность, переводим изображение в RGBA перед заливкой
-                                    if pad_color and len(pad_color) == 4 and pad_color[3] == 0:
-                                        img = img.convert("RGBA")
-                                        current_pad_color = pad_color
-                                    else:
-                                        current_pad_color = pad_color if img.mode == "RGBA" else pad_color[:3]
-                                    img = ImageOps.pad(img, size, method=Image.Resampling.LANCZOS, color=current_pad_color)
+            processed_count = 0
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = {
+                    executor.submit(
+                        self.process_single_image, file, output_path, quality, resize_mode, size, lossless, pad_color, only_shrink
+                    ): file for file in files
+                }
 
-                        out_name = file.stem + ".webp"
-                        final_dest = output_path / out_name
-                        img.save(final_dest, "webp", quality=quality, lossless=lossless)
-                        self.log(f"OK: {file.name} -> {out_name}")
+                for future in concurrent.futures.as_completed(futures):
+                    if self.stop_event.is_set():
+                        # Отменяем еще не начатые задачи
+                        for f in futures:
+                            f.cancel()
+                        break
+                    
+                    if not self.winfo_exists():
+                        for f in futures:
+                            f.cancel()
+                        return
                         
-                except Exception as e:
-                    self.log(f"Ошибка в файле {file.name}: {e}")
-                
-                # Прерываем обновления UI, если окно было закрыто
-                if not self.winfo_exists():
-                    return
-                
-                progress_val = i / total_files
-                self.progress_bar.set(progress_val)
-                self.lbl_progress_pct.configure(text=f"{int(progress_val * 100)}%")
+                    success, msg = future.result()
+                    if msg:
+                        self.log(msg)
+                        
+                    processed_count += 1
+                    progress_val = processed_count / total_files
+                    
+                    self.progress_bar.set(progress_val)
+                    self.lbl_progress_pct.configure(text=f"{int(progress_val * 100)}%")
             
             if self.stop_event.is_set():
                 self.log("--- ОПЕРАЦИЯ ПРЕРВАНА ---")
